@@ -16,8 +16,8 @@ export class DocumentService {
       rendered = rendered.replace(regex, String(val));
     }
 
-    // استبدال أي حقول متبقية بنقاط فارغة
-    rendered = rendered.replace(/{{\\s*\\w+\\s*}}/g, '.......................');
+    // استبدال أي حقول لم يتم ملؤها بنقاط فارغة لتجنب ظهور الأقواس المعقوفة
+    rendered = rendered.replace(/\{\{[\s\S]*?\}\}/g, '.......................');
 
     return {
       templateTitle: template.title,
@@ -35,9 +35,9 @@ export class DocumentService {
     renderedContent: string
   ) {
     const res = await pool.query(
-      `INSERT INTO generated_documents (template_id, user_data, file_path)
-       VALUES ($1, $2, $3) RETURNING id, created_at`,
-      [templateId, JSON.stringify(userData), 'in-app-text-render']
+      `INSERT INTO generated_documents (user_id, template_id, user_data, file_path)
+       VALUES ($1, $2, $3, $4) RETURNING id, created_at`,
+      [userId, templateId, JSON.stringify(userData), 'in-app-text-render']
     );
     return res.rows[0];
   }

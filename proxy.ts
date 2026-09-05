@@ -3,7 +3,7 @@ import type { NextRequest } from 'next/server';
 import { verifyToken } from '@/lib/jwt';
 
 // المسارات التي تتطلب تسجيل الدخول
-const PROTECTED_PREFIXES = ['/api/chat'];
+const PROTECTED_PREFIXES = ['/api/chat', '/api/admin'];
 
 export async function proxy(request: NextRequest) {
   const { pathname } = request.nextUrl;

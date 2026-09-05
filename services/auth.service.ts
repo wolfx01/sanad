@@ -71,3 +71,33 @@ export async function authenticateUser(
   const { password_hash, ...safeUser } = user;
   return safeUser;
 }
+
+export async function getAllUsersWithStats(): Promise<any[]> {
+  const result = await pool.query(`
+    SELECT 
+      u.id, 
+      u.name, 
+      u.email, 
+      u.role, 
+      u.created_at,
+      COUNT(DISTINCT gd.id) AS total_documents,
+      COUNT(DISTINCT cs.id) AS total_sessions
+    FROM users u
+    LEFT JOIN generated_documents gd ON gd.user_id = u.id
+    LEFT JOIN chat_sessions cs ON cs.user_id = u.id
+    GROUP BY u.id, u.name, u.email, u.role, u.created_at
+    ORDER BY u.created_at DESC
+  `);
+  return result.rows;
+}
+
+export async function updateUserRole(userId: number, newRole: 'admin' | 'user'): Promise<SafeUser> {
+  const result = await pool.query(
+    `UPDATE users SET role = $1 WHERE id = $2 RETURNING id, name, email, role, created_at`,
+    [newRole, userId]
+  );
+  if (result.rows.length === 0) {
+    throw new Error('المستخدم غير موجود');
+  }
+  return result.rows[0];
+}

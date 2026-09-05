@@ -426,7 +426,7 @@ export default function ChatPage() {
             title="إخفاء القائمة الجانبية"
             style={{
               background: 'transparent',
-              color: 'rgba(255, 255, 255, 0.7)',
+              color: '#64748b',
               border: 'none',
               width: '32px',
               height: '32px',
@@ -454,7 +454,7 @@ export default function ChatPage() {
           </div>
 
           {sessions.length === 0 ? (
-            <div style={{ fontSize: '0.82rem', color: 'rgba(255,255,255,0.4)', padding: '1.5rem 1rem', textAlign: 'center' }}>
+            <div style={{ fontSize: '0.82rem', color: '#94a3b8', padding: '1.5rem 1rem', textAlign: 'center' }}>
               لا توجد محادثات سابقة بعد
             </div>
           ) : (
@@ -481,6 +481,34 @@ export default function ChatPage() {
             ))
           )}
         </div>
+
+        {/* زر لوحة تحكم المشرف للمدراء */}
+        {user?.role === 'admin' && (
+          <div style={{ padding: '0 0.85rem 0.65rem' }}>
+            <Link
+              href="/admin"
+              style={{
+                display: 'flex',
+                alignItems: 'center',
+                justifyContent: 'center',
+                gap: '0.5rem',
+                width: '100%',
+                padding: '0.65rem 0.8rem',
+                background: '#0f172a',
+                color: '#ffffff',
+                borderRadius: '8px',
+                textDecoration: 'none',
+                fontSize: '0.85rem',
+                fontWeight: 600,
+                border: '1px solid #0f172a',
+                transition: 'all 0.2s ease',
+              }}
+            >
+              <span>🛡️</span>
+              <span>لوحة الإدارة (Admin)</span>
+            </Link>
+          </div>
+        )}
 
         {/* تذييل الشريط الجانبي: معلومات المستخدم وزر الخروج */}
         <div className="sidebar-footer">
@@ -592,14 +620,15 @@ export default function ChatPage() {
               >
                 <div
                   style={{
-                    width: '64px',
-                    height: '64px',
-                    borderRadius: '20px',
-                    background: 'rgba(232, 168, 124, 0.2)',
+                    width: '56px',
+                    height: '56px',
+                    borderRadius: '14px',
+                    background: '#f1f5f9',
+                    border: '1px solid var(--border)',
                     display: 'flex',
                     alignItems: 'center',
                     justifyContent: 'center',
-                    fontSize: '2rem',
+                    fontSize: '1.75rem',
                     marginBottom: '1.25rem',
                   }}
                 >
@@ -663,9 +692,8 @@ export default function ChatPage() {
                                 style={{
                                   marginTop: '0.85rem',
                                   padding: '0.85rem 1rem',
-                                  background:
-                                    'linear-gradient(135deg, rgba(232, 168, 124, 0.15) 0%, rgba(45, 27, 78, 0.05) 100%)',
-                                  border: '1.5px solid var(--accent)',
+                                  background: '#f8fafc',
+                                  border: '1px solid #cbd5e1',
                                   borderRadius: '12px',
                                   textAlign: 'center',
                                 }}

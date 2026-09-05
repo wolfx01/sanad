@@ -101,6 +101,13 @@ export class ChatService {
           activeTemplate = templates.find((t) => t.id === templateId) || null;
         }
 
+        // حساب الحقول الناقصة لهذا القالب لإلزام الذكاء الاصطناعي بها بدقة
+        const pendingFields = activeTemplate
+          ? activeTemplate.required_fields.filter(
+              (f) => !extractedFields[f.key] || String(extractedFields[f.key]).trim() === ''
+            )
+          : [];
+
         const systemPrompt = `
 أنت "سند"، مساعد ذكي متخصص في صياغة العقود والمستندات القانونية باللغة العربية بأسلوب ودود وموجز ومهني.
 
@@ -108,19 +115,25 @@ export class ChatService {
 ${templates
   .map(
     (t) => `- قالب رقم ${t.id}: "${t.title}"
-  الحقول المطلوبة: ${t.required_fields.map((f) => `${f.key} (${f.label})`).join(', ')}`
+  الحقول الإلزامية (${t.required_fields.length} حقول): ${t.required_fields.map((f) => `${f.key} (${f.label})`).join(', ')}`
   )
   .join('\n')}
 
 الحالة الحالية:
 - القالب المختار: ${activeTemplate ? `رقم ${activeTemplate.id} (${activeTemplate.title})` : 'لم يحدد بعد'}
-- الحقول المستخرجة سابقاً: ${JSON.stringify(extractedFields)}
+- الحقول التي تم جمعها حتى الآن: ${JSON.stringify(extractedFields)}
+${
+  activeTemplate
+    ? `- الحقول المتبقية المطلوب جمعها إلزامياً (${pendingFields.length} حقول متبقية):
+${pendingFields.map((f) => `  * ${f.key}: ${f.label}`).join('\n')}`
+    : ''
+}
 
-مهامك:
-1. إذا لم يتحدد القالب، حدده بناء على الرسالة واقترحه أو اسأل عنه.
+مهامك الصارمة:
+1. إذا لم يتحدد القالب، اقترحه أو اسأل عنه بناءً على رسالة العميل.
 2. استخرج من رسالة المستخدم أي قيم تطابق الحقول المطلوبة وضعها في new_extracted_fields.
-3. تفقد الحقول الناقصة واطلب من المستخدم إكمالها بلباقة واختصار (اسأل عن حقل أو اثنين في كل رسالة).
-4. عند اكتمال كافة الحقول 100%، اجعل is_complete: true وأخبره أن العقد جاهز للتوليد والمراجعة.
+3. تفقد الحقول المتبقية الناقصة واطلبها بلباقة (اسأل عن حقل أو حقلين على الأكثر في كل رسالة).
+4. تحذير حاسم: لا تجعل is_complete أبداً true إذا كان هناك أي حقل من الحقول الإلزامية لم يقدمه المستخدم بعد! فقط وحصراً عندما يتم استخراج كل الحقول الإلزامية بنسبة 100% اجعل is_complete: true.
 5. أجب حصراً بصيغة JSON:
 {
   "template_id": <رقم أو null>,
@@ -190,11 +203,31 @@ ${templates
       ...extractedFields,
       ...(parsed.new_extracted_fields || {}),
     };
-    const isComplete = Boolean(parsed.is_complete);
-    let replyText = parsed.reply || 'مرحباً، كيف يمكنني مساعدتك اليوم؟';
+
     const currentTemplate = templates.find((t) => t.id === newTemplateId) || null;
 
-    // إذا اكتمل العقد، نقوم بتثبيت وسم العقد بشكل دائم داخل الرسالة
+    // فحص صارم ومحكم على مستوى الخادم: هل اكتملت جميع الحقول فعلياً؟
+    const missingKeys = currentTemplate
+      ? currentTemplate.required_fields.filter(
+          (f) =>
+            mergedFields[f.key] === undefined ||
+            mergedFields[f.key] === null ||
+            String(mergedFields[f.key]).trim() === ''
+        )
+      : [];
+
+    const allRequiredPresent = currentTemplate ? missingKeys.length === 0 : false;
+    let isComplete = Boolean(parsed.is_complete) && allRequiredPresent;
+
+    let replyText = parsed.reply || 'مرحباً، كيف يمكنني مساعدتك اليوم؟';
+
+    // إذا ادعى الذكاء الاصطناعي اكتمال العقد بالخطأ مع وجود حقول لم يتم جمعها، نرفض الإكمال ونسأل عن الحقل الناقص فوراً!
+    if (!isComplete && missingKeys.length > 0 && parsed.is_complete) {
+      const nextField = missingKeys[0];
+      replyText = `شكراً لك على هذه المعطيات. لإنهاء صياغة ${currentTemplate?.title} بدقة، يرجى تزويدي بالآتي:\n${nextField.label}`;
+    }
+
+    // إذا اكتمل العقد بنسبة 100%، نقوم بتثبيت وسم العقد بشكل دائم داخل الرسالة وحفظه
     if (isComplete && currentTemplate) {
       try {
         await pool.query(
