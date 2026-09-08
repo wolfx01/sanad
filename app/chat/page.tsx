@@ -131,7 +131,7 @@ export default function ChatPage() {
     router.refresh();
   };
 
-  // 2. إرسال الرسالة إلى الـ API
+  // 2. إرسال الرسالة إلى الـ API بنمط الـ Streaming
   const sendMessageContent = async (text: string) => {
     if (!text.trim() || sending) return;
 
@@ -141,7 +141,19 @@ export default function ChatPage() {
       content: text.trim(),
     };
 
-    setMessages((prev) => [...prev, userMessage]);
+    const assistantMsgId = (Date.now() + 1).toString();
+
+    // إضافة رسالة المستخدم ورسالة المساعد كرسالة قيد الكتابة
+    setMessages((prev) => [
+      ...prev,
+      userMessage,
+      {
+        id: assistantMsgId,
+        role: 'assistant',
+        content: '',
+      },
+    ]);
+
     setInput('');
     setSending(true);
 
@@ -152,48 +164,123 @@ export default function ChatPage() {
         body: JSON.stringify({
           message: userMessage.content,
           sessionId: sessionId,
+          stream: true,
         }),
       });
 
-      if (!res.ok) {
+      if (!res.ok || !res.body) {
         throw new Error('فشل معالجة الطلب');
       }
 
-      const data = await res.json();
+      const reader = res.body.getReader();
+      const decoder = new TextDecoder('utf-8');
+      let buffer = '';
 
-      // تحديث معرف الجلسة والحقول
-      if (data.sessionId) {
-        setSessionId(data.sessionId);
-        // تحديث قائمة الجلسات
-        fetch('/api/chat')
-          .then((r) => r.json())
-          .then((d) => {
-            if (d.sessions) setSessions(d.sessions);
-          })
-          .catch(() => {});
-      }
-      if (data.templateId) setTemplateId(data.templateId);
-      if (data.templateTitle) setTemplateTitle(data.templateTitle);
-      if (data.extractedFields) setExtractedFields(data.extractedFields);
-      if (data.requiredFields) setRequiredFields(data.requiredFields);
-      if (data.isComplete !== undefined) setIsComplete(data.isComplete);
+      // طابور تدفق سلس لعرض الكلمات كلمة بعد كلمة (ChatGPT-like Typing)
+      const tokenQueue: string[] = [];
+      let displayedText = '';
+      let isLoopActive = false;
+      let isDoneReceiving = false;
+      let metaFinalReply: string | null = null;
 
-      const assistantMessage: Message = {
-        id: (Date.now() + 1).toString(),
-        role: 'assistant',
-        content: data.reply || 'تم استلام طلبك.',
+      const startTypingLoop = () => {
+        if (isLoopActive) return;
+        isLoopActive = true;
+
+        const timer = setInterval(() => {
+          if (tokenQueue.length > 0) {
+            // نأخذ كلمة أو جزء صغير
+            const nextToken = tokenQueue.shift()!;
+            displayedText += nextToken;
+
+            setMessages((prev) =>
+              prev.map((msg) =>
+                msg.id === assistantMsgId ? { ...msg, content: displayedText } : msg
+              )
+            );
+          } else if (isDoneReceiving) {
+            clearInterval(timer);
+            isLoopActive = false;
+            // إذا كان هناك رد نهائي من الميتاداتا
+            if (metaFinalReply && metaFinalReply !== displayedText) {
+              setMessages((prev) =>
+                prev.map((msg) =>
+                  msg.id === assistantMsgId ? { ...msg, content: metaFinalReply! } : msg
+                )
+              );
+            }
+          }
+        }, 22); // تدفق سلس كل 22 ملي ثانية
       };
 
-      setMessages((prev) => [...prev, assistantMessage]);
+      while (true) {
+        const { value, done } = await reader.read();
+        if (done) {
+          isDoneReceiving = true;
+          break;
+        }
+
+        buffer += decoder.decode(value, { stream: true });
+        const lines = buffer.split('\n\n');
+        buffer = lines.pop() || '';
+
+        for (const line of lines) {
+          const trimmed = line.trim();
+          if (!trimmed.startsWith('data:')) continue;
+
+          try {
+            const event = JSON.parse(trimmed.slice(5).trim());
+
+            if (event.type === 'init') {
+              if (event.sessionId) setSessionId(event.sessionId);
+              if (event.templateId) setTemplateId(event.templateId);
+              if (event.templateTitle) setTemplateTitle(event.templateTitle);
+              if (event.extractedFields) setExtractedFields(event.extractedFields);
+              if (event.requiredFields) setRequiredFields(event.requiredFields);
+            } else if (event.type === 'chunk') {
+              if (event.text) {
+                // تقسيم الـ chunk إلى كلمات ومسافات لتتدفق واحدة تلو الأخرى
+                const parts = event.text.match(/(\s+|\S+)/g) || [event.text];
+                tokenQueue.push(...parts);
+                startTypingLoop();
+              }
+            } else if (event.type === 'meta') {
+              if (event.sessionId) setSessionId(event.sessionId);
+              if (event.templateId) setTemplateId(event.templateId);
+              if (event.templateTitle) setTemplateTitle(event.templateTitle);
+              if (event.extractedFields) setExtractedFields(event.extractedFields);
+              if (event.requiredFields) setRequiredFields(event.requiredFields);
+              if (event.isComplete !== undefined) setIsComplete(event.isComplete);
+              if (event.finalReply) {
+                metaFinalReply = event.finalReply;
+              }
+
+              // تحديث قائمة الجلسات
+              fetch('/api/chat')
+                .then((r) => r.json())
+                .then((d) => {
+                  if (d.sessions) setSessions(d.sessions);
+                })
+                .catch(() => {});
+            } else if (event.type === 'done') {
+              isDoneReceiving = true;
+            }
+          } catch (err) {
+            console.warn('Error parsing SSE event:', err);
+          }
+        }
+      }
     } catch {
-      setMessages((prev) => [
-        ...prev,
-        {
-          id: (Date.now() + 1).toString(),
-          role: 'assistant',
-          content: 'عذراً، حدث خطأ أثناء الاتصال بالخادم. يرجى المحاولة مرة أخرى.',
-        },
-      ]);
+      setMessages((prev) =>
+        prev.map((msg) =>
+          msg.id === assistantMsgId
+            ? {
+                ...msg,
+                content: 'عذراً، حدث خطأ أثناء الاتصال بالخادم. يرجى المحاولة مرة أخرى.',
+              }
+            : msg
+        )
+      );
     } finally {
       setSending(false);
     }
@@ -677,75 +764,82 @@ export default function ChatPage() {
                         <span>سَنَد • المساعد القانوني</span>
                       </div>
                     )}
-                    {msg.content.includes('[CONTRACT_ACTION:') ? (
-                      <div>
-                        <div style={{ whiteSpace: 'pre-wrap' }}>
-                          {msg.content.replace(/\[CONTRACT_ACTION:[\s\S]*?\]/, '').trim()}
-                        </div>
-                        {(() => {
-                          try {
-                            const match = msg.content.match(/\[CONTRACT_ACTION:([\s\S]*?)\]/);
-                            if (!match) return null;
-                            const actionData = JSON.parse(match[1]);
-                            return (
-                              <div
-                                style={{
-                                  marginTop: '0.85rem',
-                                  padding: '0.85rem 1rem',
-                                  background: '#f8fafc',
-                                  border: '1px solid #cbd5e1',
-                                  borderRadius: '12px',
-                                  textAlign: 'center',
-                                }}
-                              >
+                    {msg.content ? (
+                      msg.content.includes('[CONTRACT_ACTION:') ? (
+                        <div>
+                          <div style={{ whiteSpace: 'pre-wrap' }}>
+                            {msg.content.replace(/\[CONTRACT_ACTION:[\s\S]*?\]/, '').trim()}
+                          </div>
+                          {(() => {
+                            try {
+                              const match = msg.content.match(/\[CONTRACT_ACTION:([\s\S]*?)\]/);
+                              if (!match) return null;
+                              const actionData = JSON.parse(match[1]);
+                              return (
                                 <div
                                   style={{
-                                    fontWeight: 700,
-                                    fontSize: '0.95rem',
-                                    color: 'var(--foreground)',
-                                    marginBottom: '0.3rem',
+                                    marginTop: '0.85rem',
+                                    padding: '0.85rem 1rem',
+                                    background: '#f8fafc',
+                                    border: '1px solid #cbd5e1',
+                                    borderRadius: '12px',
+                                    textAlign: 'center',
                                   }}
                                 >
-                                  📄 مستند رسمي جاهز: {actionData.title}
+                                  <div
+                                    style={{
+                                      fontWeight: 700,
+                                      fontSize: '0.95rem',
+                                      color: 'var(--foreground)',
+                                      marginBottom: '0.3rem',
+                                    }}
+                                  >
+                                    📄 مستند رسمي جاهز: {actionData.title}
+                                  </div>
+                                  <p
+                                    style={{
+                                      fontSize: '0.82rem',
+                                      color: 'var(--text-muted)',
+                                      marginBottom: '0.75rem',
+                                    }}
+                                  >
+                                    بيانات هذا العقد مكتملة ومحفوظة بنجاح، ويمكنك معاينته أو تحميله كـ PDF في أي وقت.
+                                  </p>
+                                  <button
+                                    type="button"
+                                    onClick={() =>
+                                      handleOpenSpecificDocument(
+                                        actionData.templateId,
+                                        actionData.title,
+                                        actionData.fields
+                                      )
+                                    }
+                                    className="btn-generate-doc"
+                                    style={{
+                                      width: '100%',
+                                      justifyContent: 'center',
+                                      fontSize: '0.92rem',
+                                      padding: '0.75rem 1rem',
+                                    }}
+                                  >
+                                    <span>📄</span>
+                                    <span>معاينة وتحميل {actionData.title} (PDF)</span>
+                                  </button>
                                 </div>
-                                <p
-                                  style={{
-                                    fontSize: '0.82rem',
-                                    color: 'var(--text-muted)',
-                                    marginBottom: '0.75rem',
-                                  }}
-                                >
-                                  بيانات هذا العقد مكتملة ومحفوظة بنجاح، ويمكنك معاينته أو تحميله كـ PDF في أي وقت.
-                                </p>
-                                <button
-                                  type="button"
-                                  onClick={() =>
-                                    handleOpenSpecificDocument(
-                                      actionData.templateId,
-                                      actionData.title,
-                                      actionData.fields
-                                    )
-                                  }
-                                  className="btn-generate-doc"
-                                  style={{
-                                    width: '100%',
-                                    justifyContent: 'center',
-                                    fontSize: '0.92rem',
-                                    padding: '0.75rem 1rem',
-                                  }}
-                                >
-                                  <span>📄</span>
-                                  <span>معاينة وتحميل {actionData.title} (PDF)</span>
-                                </button>
-                              </div>
-                            );
-                          } catch {
-                            return null;
-                          }
-                        })()}
-                      </div>
+                              );
+                            } catch {
+                              return null;
+                            }
+                          })()}
+                        </div>
+                      ) : (
+                        <div style={{ whiteSpace: 'pre-wrap' }}>{msg.content}</div>
+                      )
                     ) : (
-                      <div style={{ whiteSpace: 'pre-wrap' }}>{msg.content}</div>
+                      <div style={{ display: 'flex', alignItems: 'center', gap: '6px', color: '#64748b', fontSize: '0.88rem' }}>
+                        <span style={{ display: 'inline-block', width: '6px', height: '6px', borderRadius: '50%', background: '#3b82f6', animation: 'pulse 1s infinite' }}></span>
+                        <span>جاري الكتابة...</span>
+                      </div>
                     )}
                   </div>
                 </div>
@@ -754,15 +848,6 @@ export default function ChatPage() {
 
 
             {/* رسائل المحادثة تنتهي هنا */}
-
-
-            {sending && (
-              <div className="chat-row chat-row-assistant">
-                <div className="chat-bubble chat-bubble-assistant chat-typing">
-                  <span>⚡ سند يحلل البيانات ويجهز الخطوة التالية...</span>
-                </div>
-              </div>
-            )}
 
             <div ref={messagesEndRef} />
           </div>

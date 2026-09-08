@@ -12,7 +12,7 @@ export async function POST(request: NextRequest) {
     }
 
     const body = await request.json();
-    const { message, sessionId } = body;
+    const { message, sessionId, stream } = body;
 
     if (!message || typeof message !== 'string' || !message.trim()) {
       return NextResponse.json(
@@ -21,13 +21,20 @@ export async function POST(request: NextRequest) {
       );
     }
 
-    const result = await ChatService.processMessage(
+    const readableStream = await ChatService.processMessageStream(
       userId,
       sessionId ? Number(sessionId) : null,
       message.trim()
     );
 
-    return NextResponse.json(result);
+    return new Response(readableStream, {
+      headers: {
+        'Content-Type': 'text/event-stream; charset=utf-8',
+        'Cache-Control': 'no-cache, no-transform, private',
+        'Connection': 'keep-alive',
+        'X-Accel-Buffering': 'no',
+      },
+    });
   } catch (error: any) {
     console.error('Error in chat API:', error);
     return NextResponse.json(

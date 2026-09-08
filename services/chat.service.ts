@@ -36,6 +36,285 @@ export interface ChatResponse {
 
 export class ChatService {
   /**
+   * معالجة الرسالة بنمط التدفق الحي (Streaming) عبر Server-Sent Events
+   */
+  static async processMessageStream(
+    userId: number | null,
+    sessionId: number | null,
+    userMessage: string
+  ): Promise<ReadableStream> {
+    const templates = await TemplateService.getAllTemplates();
+
+    // 1. استرجاع أو إنشاء الجلسة
+    let currentSessionId = sessionId;
+    let templateId: number | null = null;
+    let extractedFields: Record<string, any> = {};
+
+    if (currentSessionId) {
+      const sessionRes = await pool.query(
+        'SELECT * FROM chat_sessions WHERE id = $1',
+        [currentSessionId]
+      );
+      if (sessionRes.rows.length > 0) {
+        const s = sessionRes.rows[0];
+        templateId = s.template_id;
+        extractedFields = s.extracted_fields || {};
+      }
+    } else {
+      const newSession = await pool.query(
+        'INSERT INTO chat_sessions (user_id, title, extracted_fields) VALUES ($1, $2, $3) RETURNING id',
+        [userId, 'محادثة صياغة عقد', JSON.stringify({})]
+      );
+      currentSessionId = newSession.rows[0].id;
+    }
+
+    // 2. حفظ رسالة المستخدم في قاعدة البيانات
+    await pool.query(
+      'INSERT INTO chat_messages (session_id, role, content) VALUES ($1, $2, $3)',
+      [currentSessionId, 'user', userMessage]
+    );
+
+    // 3. جلب آخر الرسائل للسياق
+    const historyRes = await pool.query(
+      'SELECT role, content FROM chat_messages WHERE session_id = $1 ORDER BY id DESC LIMIT 10',
+      [currentSessionId]
+    );
+    const history = historyRes.rows.reverse();
+
+    const targetSessionId = currentSessionId;
+    let activeTemplate = templateId ? templates.find((t) => t.id === templateId) || null : null;
+
+    const encoder = new TextEncoder();
+
+    return new ReadableStream({
+      async start(controller) {
+        const sendEvent = (obj: any) => {
+          controller.enqueue(encoder.encode(`data: ${JSON.stringify(obj)}\n\n`));
+        };
+
+        // إرسال معلومات البدء فوراً للمتصفح
+        sendEvent({
+          type: 'init',
+          sessionId: targetSessionId,
+          templateId,
+          templateTitle: activeTemplate ? activeTemplate.title : null,
+          extractedFields,
+          requiredFields: activeTemplate ? activeTemplate.required_fields : null,
+        });
+
+        const apiKey = process.env.OPENAI_API_KEY;
+        let streamedFullText = '';
+        let aiSuccess = false;
+
+        if (apiKey && (apiKey.startsWith('sk-') || apiKey.startsWith('sk-or-'))) {
+          try {
+            const { client, model } = getAiClient();
+
+            const pendingFields = activeTemplate
+              ? activeTemplate.required_fields.filter(
+                  (f) => !extractedFields[f.key] || String(extractedFields[f.key]).trim() === ''
+                )
+              : [];
+
+            const systemPrompt = `
+أنت "سند"، مساعد ذكي متخصص في صياغة العقود والمستندات القانونية باللغة العربية بأسلوب ودود وموجز ومهني.
+
+القوالب المتاحة في النظام:
+${templates
+  .map(
+    (t) => `- قالب رقم ${t.id}: "${t.title}"
+  الحقول الإلزامية (${t.required_fields.length} حقول): ${t.required_fields.map((f) => `${f.key} (${f.label})`).join(', ')}`
+  )
+  .join('\n')}
+
+الحالة الحالية:
+- القالب المختار: ${activeTemplate ? `رقم ${activeTemplate.id} (${activeTemplate.title})` : 'لم يحدد بعد'}
+- الحقول التي تم جمعها حتى الآن: ${JSON.stringify(extractedFields)}
+${
+  activeTemplate
+    ? `- الحقول المتبقية المطلوب جمعها إلزامياً (${pendingFields.length} حقول متبقية):
+${pendingFields.map((f) => `  * ${f.key}: ${f.label}`).join('\n')}`
+    : ''
+}
+
+طريقة الرد والتعليمات الصارمة:
+1. اكتب ردك التفاعلي باللغة العربية مباشرة وبسلاسة لمساعدة المستخدم وجمع الحقول الناقصة.
+2. لا تظهر أي أكواد أو JSON في نص ردك التفاعلي.
+3. في نهاية رسالتك تماماً، في سطر مستقل جديد، ضع ملخص البيانات المحصورة بين العلامتين <<<DATA: و >>> بصيغة JSON كالتالي حصراً:
+<<<DATA:{"template_id":<رقم أو null>,"new_extracted_fields":{<المفاتيح والقيم المستخرجة>},"is_complete":<true أو false>}>>>
+4. تحذير حاسم: لا تجعل is_complete أبداً true إذا كان هناك أي حقل من الحقول الإلزامية لم يقدمه المستخدم بعد!
+`.trim();
+
+            const stream = await client.chat.completions.create({
+              model,
+              temperature: 0.3,
+              stream: true,
+              messages: [
+                { role: 'system', content: systemPrompt },
+                ...history.map((m) => ({
+                  role: m.role as 'user' | 'assistant',
+                  content: m.content,
+                })),
+              ],
+            });
+
+            aiSuccess = true;
+            let dataTagBuffer = '';
+            let isInsideDataTag = false;
+
+            for await (const chunk of stream) {
+              const delta = chunk.choices[0]?.delta?.content || '';
+              if (!delta) continue;
+
+              streamedFullText += delta;
+
+              // معالجة تدفق النص مع عزل وسم <<<DATA: ... >>> عن شاشة المستخدم
+              if (!isInsideDataTag) {
+                if (streamedFullText.includes('<<<DATA:')) {
+                  isInsideDataTag = true;
+                  const parts = streamedFullText.split('<<<DATA:');
+                  const visibleText = parts[0];
+                  // لم نعد نرسل بعد الوصول للوسم
+                } else {
+                  sendEvent({ type: 'chunk', text: delta });
+                }
+              }
+            }
+          } catch (err: any) {
+            console.warn('AI Streaming API error, switching to fallback:', err.message);
+            aiSuccess = false;
+          }
+        }
+
+        // معالجة البيانات المستخرجة
+        let parsed: {
+          template_id?: number | null;
+          reply?: string;
+          new_extracted_fields?: Record<string, any>;
+          is_complete?: boolean;
+        } | null = null;
+
+        let cleanReply = streamedFullText;
+
+        if (aiSuccess && streamedFullText.includes('<<<DATA:')) {
+          const match = streamedFullText.match(/<<<DATA:([\s\S]*?)>>>/);
+          if (match && match[1]) {
+            try {
+              parsed = JSON.parse(match[1].trim());
+            } catch (e) {
+              console.warn('Failed to parse streaming metadata JSON:', e);
+            }
+          }
+          cleanReply = streamedFullText.replace(/<<<DATA:[\s\S]*?>>>/, '').trim();
+        }
+
+        // إذا فشل الاتصال أو لم يكن هناك مفتاح، نستخدم المحرك الاحتياطي
+        if (!aiSuccess || !cleanReply.trim()) {
+          const fallback = ChatService.fallbackRuleEngine(userMessage, templateId, extractedFields, templates);
+          cleanReply = fallback.reply;
+          parsed = {
+            template_id: fallback.template_id,
+            new_extracted_fields: fallback.new_extracted_fields,
+            is_complete: fallback.is_complete,
+          };
+
+          // تدفق نص الـ fallback كلمة بكلمة
+          const words = cleanReply.split(' ');
+          for (let i = 0; i < words.length; i++) {
+            const word = words[i] + (i < words.length - 1 ? ' ' : '');
+            sendEvent({ type: 'chunk', text: word });
+            await new Promise((r) => setTimeout(r, 18));
+          }
+        }
+
+        let newTemplateId = parsed?.template_id || templateId;
+
+        // التحقق من الحقول المدمجة
+        const mergedFields = {
+          ...extractedFields,
+          ...(parsed?.new_extracted_fields || {}),
+        };
+
+        const currentTemplate = templates.find((t) => t.id === newTemplateId) || null;
+
+        const missingKeys = currentTemplate
+          ? currentTemplate.required_fields.filter(
+              (f) =>
+                mergedFields[f.key] === undefined ||
+                mergedFields[f.key] === null ||
+                String(mergedFields[f.key]).trim() === ''
+            )
+          : [];
+
+        const allRequiredPresent = currentTemplate ? missingKeys.length === 0 : false;
+        const isComplete = Boolean(parsed?.is_complete) && allRequiredPresent;
+
+        let finalReplyText = cleanReply;
+
+        // إذا اكتمل العقد
+        if (isComplete && currentTemplate) {
+          try {
+            await pool.query(
+              'INSERT INTO generated_documents (template_id, user_data, file_path) VALUES ($1, $2, $3)',
+              [newTemplateId, JSON.stringify(mergedFields), 'completed']
+            );
+          } catch (e) {
+            console.error('Failed to save to generated_documents:', e);
+          }
+
+          const actionData = JSON.stringify({
+            templateId: newTemplateId,
+            title: currentTemplate.title,
+            fields: mergedFields,
+          });
+
+          if (!finalReplyText.includes('[CONTRACT_ACTION:')) {
+            finalReplyText += `\n\n[CONTRACT_ACTION:${actionData}]`;
+          }
+        }
+
+        // تحديث الجلسة في قاعدة البيانات
+        if (newTemplateId && newTemplateId !== templateId) {
+          const chosenTemplate = templates.find((t) => t.id === newTemplateId);
+          if (chosenTemplate) {
+            await pool.query(
+              'UPDATE chat_sessions SET template_id = $1, title = $2, extracted_fields = $3 WHERE id = $4',
+              [newTemplateId, chosenTemplate.title, JSON.stringify(mergedFields), targetSessionId]
+            );
+          }
+        } else {
+          await pool.query(
+            'UPDATE chat_sessions SET extracted_fields = $1 WHERE id = $2',
+            [JSON.stringify(mergedFields), targetSessionId]
+          );
+        }
+
+        // حفظ رد المساعد في جدول الرسائل
+        await pool.query(
+          'INSERT INTO chat_messages (session_id, role, content) VALUES ($1, $2, $3)',
+          [targetSessionId, 'assistant', finalReplyText]
+        );
+
+        // إرسال الميتاداتا النهائية للمتصفح
+        sendEvent({
+          type: 'meta',
+          sessionId: targetSessionId,
+          templateId: newTemplateId,
+          templateTitle: currentTemplate ? currentTemplate.title : null,
+          extractedFields: mergedFields,
+          requiredFields: currentTemplate ? currentTemplate.required_fields : null,
+          isComplete,
+          finalReply: finalReplyText,
+        });
+
+        // إنهاء التدفق
+        sendEvent({ type: 'done' });
+        controller.close();
+      },
+    });
+  }
+
+  /**
    * معالجة رسالة المحادثة وإرجاع الرد مع استخراج البيانات
    */
   static async processMessage(
@@ -152,14 +431,16 @@ ${pendingFields.map((f) => `  * ${f.key}: ${f.label}`).join('\n')}`
             ...history.map((m) => ({
               role: m.role as 'user' | 'assistant',
               content: m.content,
+
             })),
           ],
+          
         });
 
-        const rawContent = response.choices[0]?.message?.content || '{}';
+        const rawContent = (response as any)?.choices?.[0]?.message?.content || '{}';
         parsed = JSON.parse(rawContent);
       } catch (err: any) {
-        console.warn('AI API call error (falling back to local engine):', err.message);
+        console.warn('AI API call error (falling back to local engine):', err?.message || err);
         parsed = null;
       }
     }
