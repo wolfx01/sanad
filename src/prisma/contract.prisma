@@ -1,0 +1,70 @@
+// use prisma-next
+
+model User {
+  id            Int                @id @default(autoincrement())
+  name          String
+  email         String             @unique
+  password_hash String
+  role          String?            @default("user")
+  created_at    TimestamptzString? @default(now())
+
+  sessions      ChatSession[]
+  documents     GeneratedDocument[]
+
+  @@map("users")
+}
+
+model DocumentTemplate {
+  id               Int                @id @default(autoincrement())
+  title            String
+  description      String?
+  content_template String
+  required_fields  Json
+  created_at       TimestamptzString? @default(now())
+
+  sessions         ChatSession[]
+  documents        GeneratedDocument[]
+
+  @@map("document_templates")
+}
+
+model ChatSession {
+  id               Int                @id @default(autoincrement())
+  user_id          Int?
+  title            String?            @default("محادثة جديدة")
+  template_id      Int?
+  extracted_fields Json?              @default("{}")
+  created_at       TimestamptzString? @default(now())
+
+  user             User?              @relation(fields: [user_id], references: [id], onDelete: Cascade)
+  template         DocumentTemplate?  @relation(fields: [template_id], references: [id], onDelete: SetNull)
+  messages         ChatMessage[]
+
+  @@map("chat_sessions")
+}
+
+model ChatMessage {
+  id         Int                @id @default(autoincrement())
+  session_id Int?
+  role       String
+  content    String
+  created_at TimestamptzString? @default(now())
+
+  session    ChatSession?       @relation(fields: [session_id], references: [id], onDelete: Cascade)
+
+  @@map("chat_messages")
+}
+
+model GeneratedDocument {
+  id          Int                @id @default(autoincrement())
+  user_id     Int?
+  template_id Int?
+  user_data   Json
+  file_path   String?
+  created_at  TimestamptzString? @default(now())
+
+  user        User?              @relation(fields: [user_id], references: [id], onDelete: SetNull)
+  template    DocumentTemplate?  @relation(fields: [template_id], references: [id], onDelete: Cascade)
+
+  @@map("generated_documents")
+}
